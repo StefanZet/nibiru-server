@@ -240,6 +240,13 @@ io.on('connection', (socket) => {
       color: playerData.color,
     });
 
+    // Chat notification: player joined
+    socket.to(roomId).emit('chat_msg', {
+      name: '', senderId: '',
+      text: `👋 ${playerName} s-a alăturat vânătorii!`,
+      system: true,
+    });
+
     log(`${playerName} joined ${roomId} (${room.players.size}/${CONFIG.MAX_PLAYERS_PER_ROOM})`);
 
     // Auto-start când sunt minim 2 jucători (sau imediat pe dev)
@@ -315,6 +322,14 @@ io.on('connection', (socket) => {
       byId: socket.id,
     });
 
+    // Chat notification la TOȚI (inclusiv cel care a colectat)
+    io.to(currentRoom).emit('chat_msg', {
+      name: '',
+      senderId: '',
+      text: `🪐 ${player.name} a descoperit o planetă! (${room.treasures.filter(t => t.found).length}/${CONFIG.TREASURE_COUNT})`,
+      system: true,
+    });
+
     log(`${player.name} collected treasure #${treasureId} in ${currentRoom}`);
 
     // Check dacă toate comorile au fost găsite
@@ -337,6 +352,7 @@ io.on('connection', (socket) => {
     // Broadcast la toți din room (inclusiv sender)
     io.to(currentRoom).emit('chat_msg', {
       name: player.name,
+      senderId: socket.id,
       text,
       system: false,
     });
