@@ -1,14 +1,15 @@
 {
-  "name": "n-test-treasure-hunt-server",
+  "name": "ntest-treasure-hunt-server",
   "version": "1.0.0",
+  "description": "N TEST Treasure Hunt - Multiplayer Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js --dev"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "socket.io": "^4.8.1"
+    "express": "^4.18.2",
+    "socket.io": "^4.7.4",
+    "cors": "^2.8.5"
   }
 }

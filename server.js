@@ -1,21 +1,38 @@
+// ============================================================
+// N TEST TREASURE HUNT — Multiplayer Server
+// Node.js + Express + Socket.io
+//
+// Arhitectură:
+// - Rooms cu max 20 jucători
+// - Auto-matchmaking (intri → ești pus în room disponibil)
+// - Server-side validation pentru colectare (anti-cheat)
+// - Broadcast optimizat (doar pozițiile, 15 tick/s)
+// - Poate rula pe un VPS de 5€ pentru test
+// - Scalabil pe mai multe procese/servere
+//
+// Usage:
+//   npm install
+//   npm start           (production, port 3000)
+//   npm run dev          (dev mode cu logging)
+// ============================================================
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const path = require('path');
 
 // ===================== CONFIG =====================
 const CONFIG = {
   PORT: process.env.PORT || 3000,
-  CLIENT_ORIGIN: 'https://test.streetartstudios.net',
-
   MAX_PLAYERS_PER_ROOM: 20,
-  TICK_RATE: 15,
+  TICK_RATE: 15,                    // updates pe secundă trimise la clienți
   WORLD_SIZE: 200,
   TREASURE_COUNT: 5,
-  GAME_TIME_LIMIT: 300, // 5 minute
-  INTERACT_DISTANCE: 5,
-  PLAYER_SPEED_MAX: 30, // unități / secundă
-  ROOM_CLEANUP_INTERVAL: 30000,
+  GAME_TIME_LIMIT: 300,             // 5 minute
+  INTERACT_DISTANCE: 5,             // distanță colectare (server-side check)
+  PLAYER_SPEED_MAX: 0.5,            // viteză maximă acceptată (anti-speed-hack)
+  ROOM_CLEANUP_INTERVAL: 30000,     // curăță rooms goale la 30s
   DEV_MODE: process.argv.includes('--dev'),
 
   PRIZES: [
@@ -31,32 +48,35 @@ const CONFIG = {
 const app = express();
 const server = http.createServer(app);
 
-app.use(cors({
-  origin: [CONFIG.CLIENT_ORIGIN],
-  methods: ['GET', 'POST'],
-}));
-
-app.use(express.json());
-
-// Root endpoint simplu
-app.get('/', (req, res) => {
-  res.json({
-    status: 'API OK',
-    name: 'N TEST TREASURE HUNT Multiplayer Server',
-  });
+const io = new Server(server, {
+  cors: {
+    origin: '*',  // În producție: pune domeniul exact
+    methods: ['GET', 'POST'],
+  },
+  // Optimizări pentru multe conexiuni
+  pingTimeout: 20000,
+  pingInterval: 10000,
+  maxHttpBufferSize: 1e4,  // 10KB max per message
+  perMessageDeflate: false, // dezactivat pentru latență mai mică
 });
 
-// Health check endpoint
+// Servește frontend-ul static
+app.use(cors());
+app.use(express.static(path.join(__dirname, '..', 'client')));
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'client', 'index.html'));
+});
+
+// Health check endpoint (pentru load balancer)
 app.get('/health', (req, res) => {
   const roomCount = Object.keys(rooms).length;
   const playerCount = Object.values(rooms).reduce((sum, r) => sum + r.players.size, 0);
-
   res.json({
     status: 'ok',
     rooms: roomCount,
     players: playerCount,
     uptime: Math.floor(process.uptime()),
-    timestamp: Date.now(),
   });
 });
 
@@ -67,26 +87,10 @@ app.get('/stats', (req, res) => {
     players: room.players.size,
     maxPlayers: CONFIG.MAX_PLAYERS_PER_ROOM,
     started: room.started,
-    ended: room.ended,
     elapsed: room.started ? Math.floor((Date.now() - room.startTime) / 1000) : 0,
     treasuresLeft: room.treasures.filter(t => !t.found).length,
   }));
-
-  res.json({
-    rooms: stats,
-    totalPlayers: stats.reduce((sum, room) => sum + room.players, 0),
-  });
-});
-
-const io = new Server(server, {
-  cors: {
-    origin: [CONFIG.CLIENT_ORIGIN],
-    methods: ['GET', 'POST'],
-  },
-  pingTimeout: 20000,
-  pingInterval: 10000,
-  maxHttpBufferSize: 1e4,
-  perMessageDeflate: false,
+  res.json({ rooms: stats, totalPlayers: stats.reduce((s, r) => s + r.players, 0) });
 });
 
 // ===================== ROOM MANAGEMENT =====================
@@ -96,11 +100,11 @@ let roomCounter = 0;
 function createRoom() {
   const roomId = `room_${++roomCounter}_${Date.now().toString(36)}`;
 
+  // Generează poziții treasure random (server-side = sursă de adevăr)
   const treasures = [];
   for (let i = 0; i < CONFIG.TREASURE_COUNT; i++) {
     let pos;
     let attempts = 0;
-
     do {
       pos = {
         x: (Math.random() - 0.5) * CONFIG.WORLD_SIZE * 0.8,
@@ -124,10 +128,9 @@ function createRoom() {
 
   rooms[roomId] = {
     id: roomId,
-    players: new Map(),
+    players: new Map(),       // socketId → playerData
     treasures,
     started: false,
-    ended: false,
     startTime: null,
     endTime: null,
     createdAt: Date.now(),
@@ -138,32 +141,33 @@ function createRoom() {
 }
 
 function findAvailableRoom() {
+  // Caută un room cu loc care nu a început încă sau e recent
   for (const [id, room] of Object.entries(rooms)) {
-    if (room.players.size >= CONFIG.MAX_PLAYERS_PER_ROOM) continue;
-    if (room.ended) continue;
-    if (room.endTime && Date.now() > room.endTime) continue;
-    return id;
+    if (room.players.size < CONFIG.MAX_PLAYERS_PER_ROOM) {
+      // Nu pune în rooms expirate
+      if (room.started && room.endTime && Date.now() > room.endTime) continue;
+      return id;
+    }
   }
-
+  // Nu există room disponibil, creează unul nou
   return createRoom();
 }
 
 function cleanupRooms() {
   const now = Date.now();
-
   for (const [id, room] of Object.entries(rooms)) {
+    // Șterge rooms goale mai vechi de 60s
     if (room.players.size === 0 && now - room.createdAt > 60000) {
       delete rooms[id];
       log(`Room cleaned up: ${id}`);
-      continue;
     }
-
+    // Șterge rooms expirate (jocul terminat de > 2 min)
     if (room.endTime && now - room.endTime > 120000) {
+      // Deconectează jucătorii rămași
       for (const [sid] of room.players) {
         const s = io.sockets.sockets.get(sid);
         if (s) s.emit('room_expired');
       }
-
       delete rooms[id];
       log(`Room expired and cleaned: ${id}`);
     }
@@ -180,9 +184,8 @@ io.on('connection', (socket) => {
   log(`Player connected: ${socket.id}`);
 
   // ---- JOIN ----
-  socket.on('join', (data = {}) => {
-    playerName = String(data.name || 'Jucător').substring(0, 20);
-
+  socket.on('join', (data) => {
+    playerName = (data.name || 'Jucător').substring(0, 20); // truncate name
     const roomId = findAvailableRoom();
     const room = rooms[roomId];
     if (!room) return;
@@ -190,19 +193,21 @@ io.on('connection', (socket) => {
     currentRoom = roomId;
     socket.join(roomId);
 
+    // Player data
     const playerData = {
       id: socket.id,
       name: playerName,
-      x: (Math.random() - 0.5) * 20,
+      x: (Math.random() - 0.5) * 20,  // spawn aproape de centru
       z: (Math.random() - 0.5) * 20,
       angle: 0,
       score: 0,
-      color: Math.floor(Math.random() * 8),
+      color: Math.floor(Math.random() * 8), // index culoare
       lastUpdate: Date.now(),
     };
 
     room.players.set(socket.id, playerData);
 
+    // Trimite jucătorului info-ul room-ului
     socket.emit('joined', {
       roomId,
       playerId: socket.id,
@@ -219,92 +224,91 @@ io.on('connection', (socket) => {
         z: p.z,
         angle: p.angle,
         color: p.color,
-        score: p.score,
       })),
       gameTime: CONFIG.GAME_TIME_LIMIT,
       started: room.started,
-      ended: room.ended,
-      elapsed: room.started && room.startTime
-        ? Math.floor((Date.now() - room.startTime) / 1000)
-        : 0,
+      elapsed: room.started ? Math.floor((Date.now() - room.startTime) / 1000) : 0,
     });
 
+    // Anunță ceilalți jucători
     socket.to(roomId).emit('player_joined', {
       id: socket.id,
       name: playerName,
       x: playerData.x,
       z: playerData.z,
-      angle: playerData.angle,
+      angle: 0,
       color: playerData.color,
-      score: playerData.score,
     });
 
     log(`${playerName} joined ${roomId} (${room.players.size}/${CONFIG.MAX_PLAYERS_PER_ROOM})`);
 
-    if (!room.started && !room.ended && (room.players.size >= 2 || CONFIG.DEV_MODE)) {
+    // Auto-start când sunt minim 2 jucători (sau imediat pe dev)
+    if (!room.started && (room.players.size >= 2 || CONFIG.DEV_MODE)) {
       startRoom(roomId);
     }
   });
 
   // ---- PLAYER POSITION UPDATE ----
-  socket.on('pos', (data = {}) => {
+  socket.on('pos', (data) => {
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     const player = room.players.get(socket.id);
     if (!player) return;
-    if (room.ended) return;
 
-    const now = Date.now();
-    const nextX = Number(data.x || 0);
-    const nextZ = Number(data.z || 0);
-    const nextA = Number(data.a || 0);
-
-    const dx = nextX - player.x;
-    const dz = nextZ - player.z;
+    // Anti-cheat: verifică viteza
+    const dx = data.x - player.x;
+    const dz = data.z - player.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
-    const dt = (now - player.lastUpdate) / 1000;
+    const dt = (Date.now() - player.lastUpdate) / 1000;
 
-    if (dt > 0 && dist / dt > CONFIG.PLAYER_SPEED_MAX) {
-      log(`Speed hack detected: ${player.name} (${(dist / dt).toFixed(1)} u/s)`);
+    if (dt > 0 && dist / dt > CONFIG.PLAYER_SPEED_MAX * 60) {
+      // Mișcare prea rapidă — probabil hack, ignoră
+      log(`Speed hack detected: ${player.name} (${(dist/dt).toFixed(1)} u/s)`);
       return;
     }
 
-    player.x = Math.max(-CONFIG.WORLD_SIZE, Math.min(CONFIG.WORLD_SIZE, nextX));
-    player.z = Math.max(-CONFIG.WORLD_SIZE, Math.min(CONFIG.WORLD_SIZE, nextZ));
-    player.angle = nextA;
-    player.lastUpdate = now;
+    // Clamp la world bounds
+    player.x = Math.max(-CONFIG.WORLD_SIZE, Math.min(CONFIG.WORLD_SIZE, data.x || 0));
+    player.z = Math.max(-CONFIG.WORLD_SIZE, Math.min(CONFIG.WORLD_SIZE, data.z || 0));
+    player.angle = data.a || 0;
+    player.lastUpdate = Date.now();
   });
 
   // ---- COLLECT TREASURE ----
-  socket.on('collect', (data = {}) => {
+  socket.on('collect', (data) => {
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     const player = room.players.get(socket.id);
-    if (!player || !room.started || room.ended) return;
+    if (!player || !room.started) return;
 
-    const treasureId = Number(data.id);
+    const treasureId = data.id;
     const treasure = room.treasures.find(t => t.id === treasureId);
     if (!treasure || treasure.found) return;
 
+    // Server-side distance check (anti-cheat)
     const dist = Math.hypot(player.x - treasure.x, player.z - treasure.z);
     if (dist > CONFIG.INTERACT_DISTANCE) {
       log(`Collect cheat attempt: ${player.name} dist=${dist.toFixed(1)}`);
       return;
     }
 
+    // Valid collection!
     treasure.found = true;
     treasure.foundBy = socket.id;
     player.score++;
 
+    // Generează cod premiu
     const code = 'NTEST-' + Math.random().toString(36).substring(2, 6).toUpperCase();
 
+    // Trimite confirmarea celui care a colectat
     socket.emit('collect_ok', {
       id: treasureId,
       prize: treasure.prize,
-      code,
+      code: code,
       score: player.score,
     });
 
+    // Anunță toți ceilalți din room
     socket.to(currentRoom).emit('treasure_collected', {
       id: treasureId,
       byName: player.name,
@@ -313,6 +317,7 @@ io.on('connection', (socket) => {
 
     log(`${player.name} collected treasure #${treasureId} in ${currentRoom}`);
 
+    // Check dacă toate comorile au fost găsite
     const allFound = room.treasures.every(t => t.found);
     if (allFound) {
       endRoom(currentRoom, 'all_found');
@@ -320,15 +325,16 @@ io.on('connection', (socket) => {
   });
 
   // ---- CHAT ----
-  socket.on('chat', (data = {}) => {
+  socket.on('chat', (data) => {
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     const player = room.players.get(socket.id);
-    if (!player || room.ended) return;
+    if (!player) return;
 
-    const text = String(data.text || '').substring(0, 120).trim();
+    const text = (data.text || '').substring(0, 120); // truncate
     if (!text) return;
 
+    // Broadcast la toți din room (inclusiv sender)
     io.to(currentRoom).emit('chat_msg', {
       name: player.name,
       text,
@@ -336,11 +342,11 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ---- PLAYER READY ----
+  // ---- PLAYER READY (apasă Start Hunt) ----
   socket.on('ready', () => {
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
-    if (!room.started && !room.ended) {
+    if (!room.started) {
       startRoom(currentRoom);
     }
   });
@@ -354,6 +360,7 @@ io.on('connection', (socket) => {
 
       room.players.delete(socket.id);
 
+      // Anunță ceilalți
       socket.to(currentRoom).emit('player_left', {
         id: socket.id,
         name,
@@ -367,11 +374,11 @@ io.on('connection', (socket) => {
 // ===================== ROOM LIFECYCLE =====================
 function startRoom(roomId) {
   const room = rooms[roomId];
-  if (!room || room.started || room.ended) return;
+  if (!room || room.started) return;
 
   room.started = true;
   room.startTime = Date.now();
-  room.endTime = room.startTime + CONFIG.GAME_TIME_LIMIT * 1000;
+  room.endTime = Date.now() + CONFIG.GAME_TIME_LIMIT * 1000;
 
   io.to(roomId).emit('game_start', {
     startTime: room.startTime,
@@ -379,6 +386,7 @@ function startRoom(roomId) {
     duration: CONFIG.GAME_TIME_LIMIT,
   });
 
+  // Timer server-side pentru expirare
   setTimeout(() => {
     if (rooms[roomId] && rooms[roomId].started && !rooms[roomId].ended) {
       endRoom(roomId, 'time_up');
@@ -390,18 +398,14 @@ function startRoom(roomId) {
 
 function endRoom(roomId, reason) {
   const room = rooms[roomId];
-  if (!room || room.ended) return;
+  if (!room) return;
 
   room.ended = true;
-  const elapsed = room.startTime
-    ? Math.floor((Date.now() - room.startTime) / 1000)
-    : 0;
+  const elapsed = Math.floor((Date.now() - room.startTime) / 1000);
 
+  // Scoreboard
   const scoreboard = Array.from(room.players.values())
-    .map(p => ({
-      name: p.name,
-      score: p.score,
-    }))
+    .map(p => ({ name: p.name, score: p.score }))
     .sort((a, b) => b.score - a.score);
 
   io.to(roomId).emit('game_end', {
@@ -413,22 +417,23 @@ function endRoom(roomId, reason) {
   log(`Game ended in ${roomId}: ${reason} (${elapsed}s)`);
 }
 
-// ===================== GAME TICK =====================
+// ===================== GAME TICK (broadcast positions) =====================
 setInterval(() => {
   for (const [roomId, room] of Object.entries(rooms)) {
     if (room.players.size === 0) continue;
-    if (room.ended) continue;
 
+    // Construiește array compact de poziții
     const positions = [];
     for (const [sid, p] of room.players) {
       positions.push({
         id: sid,
-        x: Math.round(p.x * 100) / 100,
+        x: Math.round(p.x * 100) / 100,  // 2 decimale e suficient
         z: Math.round(p.z * 100) / 100,
         a: Math.round(p.angle * 100) / 100,
       });
     }
 
+    // Broadcast la toți din room
     io.to(roomId).volatile.emit('tick', positions);
   }
 }, 1000 / CONFIG.TICK_RATE);
@@ -436,28 +441,26 @@ setInterval(() => {
 // ===================== LOGGING =====================
 function log(msg) {
   if (CONFIG.DEV_MODE) {
-    console.log(`[${new Date().toISOString().substring(11, 19)}] ${msg}`);
+    console.log(`[${new Date().toISOString().substr(11, 8)}] ${msg}`);
   }
 }
 
 // ===================== START =====================
 server.listen(CONFIG.PORT, () => {
   console.log(`
-╔════════════════════════════════════════════════════╗
-║   N TEST TREASURE HUNT — Multiplayer Server       ║
-║   Port: ${String(CONFIG.PORT).padEnd(36, ' ')}║
-║   Max per room: ${String(CONFIG.MAX_PLAYERS_PER_ROOM).padEnd(28, ' ')}║
-║   Tick rate: ${String(CONFIG.TICK_RATE).padEnd(31, ' ')}║
-║   Mode: ${CONFIG.DEV_MODE ? 'DEVELOPMENT' : 'PRODUCTION'}${CONFIG.DEV_MODE ? ' '.repeat(23) : ' '.repeat(24)}║
-╚════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════╗
+║   N TEST TREASURE HUNT — Multiplayer Server  ║
+║   Port: ${CONFIG.PORT}                              ║
+║   Max per room: ${CONFIG.MAX_PLAYERS_PER_ROOM}                          ║
+║   Tick rate: ${CONFIG.TICK_RATE} Hz                          ║
+║   Mode: ${CONFIG.DEV_MODE ? 'DEVELOPMENT' : 'PRODUCTION '}                     ║
+╚══════════════════════════════════════════════╝
   `);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('Shutting down...');
-  io.emit('server_restart', {
-    message: 'Server se restartează, reconectare automată...',
-  });
+  io.emit('server_restart', { message: 'Server se restartează, reconectare automată...' });
   server.close(() => process.exit(0));
 });
